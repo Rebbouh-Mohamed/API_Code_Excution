@@ -81,11 +81,11 @@ const commandMap = (jobID, language) => {
                 compileCodeCommand: 'fpc',
                 compilationArgs: [
                     `${CODES_DIR}/${jobID}.pas`,
-                    `-FE${OUTPUTS_DIR}`,  
-                    `-o${jobID}`          
+                    `-FE${OUTPUTS_DIR}`,
+                    `-o${jobID}`
                 ],
-                executeCodeCommand: `${OUTPUTS_DIR}/${jobID}`, 
-                outputExt: '', 
+                executeCodeCommand: `${OUTPUTS_DIR}/${jobID}`,
+                outputExt: 'bin', // Changed from empty string to 'bin'
                 compilerInfoCommand: 'fpc -iV'
             };
     }

@@ -6,7 +6,7 @@ const {info} = require("./info")
 const {spawn} = require("child_process");
 
 async function runCode({language = "", code = "", input = ""}) {
-    const timeout = 30;
+    const timeout = 10; // Reduced to 10 seconds to stay under 15s client timeout
 
     if (code === "")
         throw {
@@ -23,68 +23,168 @@ async function runCode({language = "", code = "", input = ""}) {
     const {jobID} = await createCodeFile(language, code);
     const {compileCodeCommand, compilationArgs, executeCodeCommand, executionArgs, outputExt} = commandMap(jobID, language);
 
+    // Compilation phase with timeout
     if (compileCodeCommand) {
-        await new Promise((resolve, reject) => {
-            const compileCode = spawn(compileCodeCommand, compilationArgs || [])
-            compileCode.stderr.on('data', (error) => {
-                const msg = error.toString();
+        try {
+            await new Promise((resolve, reject) => {
+                const compileCode = spawn(compileCodeCommand, compilationArgs || []);
+                let compileError = "";
+                let compileOutput = "";
+                let isResolved = false;
 
-                if (language === 'pas' && msg.includes("link.res contains output sections")) {
-                    return;
-                }
+                // Compilation timeout (5 seconds)
+                const compileTimer = setTimeout(() => {
+                    if (!isResolved) {
+                        isResolved = true;
+                        compileCode.kill("SIGKILL");
+                        reject({
+                            status: 200,
+                            output: "",
+                            error: "Compilation timed out",
+                            language,
+                        });
+                    }
+                }, 5000);
 
-                reject({
-                    status: 200,
-                    output: '',
-                    error: error.toString(),
-                    language
-                })
+                compileCode.stdout.on("data", (data) => {
+                    compileOutput += data.toString();
+                });
+
+                compileCode.stderr.on("data", (data) => {
+                    compileError += data.toString();
+                });
+
+                compileCode.on("error", (err) => {
+                    if (!isResolved) {
+                        isResolved = true;
+                        clearTimeout(compileTimer);
+                        reject({
+                            status: 200,
+                            output: "",
+                            error: `Compilation error: ${err.message}`,
+                            language,
+                        });
+                    }
+                });
+
+                compileCode.on("exit", (code) => {
+                    if (!isResolved) {
+                        isResolved = true;
+                        clearTimeout(compileTimer);
+                        
+                        if (code !== 0) {
+                            reject({
+                                status: 200,
+                                output: "",
+                                error: compileError || compileOutput || "Compilation failed",
+                                language,
+                            });
+                        } else {
+                            resolve();
+                        }
+                    }
+                });
             });
-            compileCode.on('exit', () => {
-                resolve()
-            })
-        })
+        } catch (compileResult) {
+            // Compilation failed - clean up and return error
+            await removeCodeFile(jobID, language, outputExt);
+            return {
+                ...compileResult,
+                info: await info(language)
+            };
+        }
     }
 
-    const result = await new Promise((resolve, reject) => {
-        const executeCode = spawn(executeCodeCommand, executionArgs || []);
-        let output = "", error = "";
+    // Execution phase
+    const result = await new Promise((resolve) => {
+        let output = "";
+        let error = "";
+        let isResolved = false;
 
-        const timer = setTimeout(async () => {
-            executeCode.kill("SIGHUP");
-
-            await removeCodeFile(jobID, language, outputExt);
-
-            reject({
-                status: 408,
-                error: `CodeX API Timed Out. Your code took too long to execute, over ${timeout} seconds. Make sure you are sending input as payload if your code expects an input.`
-            })
-        }, timeout * 1000);
-
-        if (input !== "") {
-            input.split('\n').forEach((line) => {
-                executeCode.stdin.write(`${line}\n`);
+        if (!executeCodeCommand) {
+            return resolve({
+                output: "",
+                error: "Executable not found"
             });
-            executeCode.stdin.end();
         }
 
-        executeCode.stdin.on('error', (err) => {
-            console.log('stdin err', err);
+        let executeCode;
+        try {
+            executeCode = spawn(executeCodeCommand, executionArgs || [], {
+                timeout: timeout * 1000
+            });
+        } catch (err) {
+            return resolve({
+                output: "",
+                error: `Runtime error: ${err.message}`
+            });
+        }
+
+        const timer = setTimeout(() => {
+            if (!isResolved) {
+                isResolved = true;
+                try {
+                    executeCode.kill("SIGKILL");
+                } catch (e) {
+                    // Process already dead
+                }
+                resolve({
+                    output: output,
+                    error: (error || "") + "\nExecution timed out after " + timeout + " seconds"
+                });
+            }
+        }, timeout * 1000);
+
+        // Handle spawn errors (ENOENT, EACCES, etc.)
+        executeCode.on("error", (err) => {
+            if (!isResolved) {
+                isResolved = true;
+                clearTimeout(timer);
+                resolve({
+                    output: "",
+                    error: `Runtime error: ${err.message}`
+                });
+            }
         });
 
-        executeCode.stdout.on('data', (data) => {
+        // Write input if provided
+        if (input !== "") {
+            try {
+                executeCode.stdin.write(input);
+                executeCode.stdin.end();
+            } catch (e) {
+                // stdin might already be closed
+            }
+        } else {
+            try {
+                executeCode.stdin.end();
+            } catch (e) {
+                // stdin might already be closed
+            }
+        }
+
+        executeCode.stdout.on("data", (data) => {
             output += data.toString();
         });
 
-        executeCode.stderr.on('data', (data) => {
+        executeCode.stderr.on("data", (data) => {
             error += data.toString();
         });
 
-        executeCode.on('exit', (err) => {
-            clearTimeout(timer);
-            resolve({output, error});
+        executeCode.on("close", (code, signal) => {
+            if (!isResolved) {
+                isResolved = true;
+                clearTimeout(timer);
+                
+                // If killed by signal, add info to error
+                if (signal) {
+                    error += `\nProcess terminated by signal: ${signal}`;
+                }
+                
+                resolve({ output, error });
+            }
         });
-    })
+    });
 
     await removeCodeFile(jobID, language, outputExt);
 
